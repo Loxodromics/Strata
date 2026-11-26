@@ -296,6 +296,15 @@ V1_V1_ALIASES = {"/v1/v1/messages": "/v1/messages", "/v1/v1/messages/count_token
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
 
 
+def model_not_found_body(path: str, message: str) -> dict:
+    """The 404 of a refused model name, in the error shape of the API that was asked."""
+    if path.startswith("/v1/messages"):
+        return {"type": "error", "error": {"type": "not_found_error", "message": message}}
+    if path == "/v1/responses":
+        return responses_error_body(message, code="model_not_found")
+    return {"error": {"type": "invalid_request_error", "code": "model_not_found", "message": message}}
+
+
 class ContextOverflow(ValueError):
     """A request that does not fit the context (a 400 on every API). It keeps the numbers, so /v1/messages can also say it the way Anthropic's API
     does: a client that decides from the wording (Claude Code compacts on "prompt is too long", and shortens max_tokens on "input length and
@@ -4863,6 +4872,7 @@ class Service:
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # default: clamp the output cap to the room left; False (--no-fit-max-tokens) = 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
+        self.strict_model = False                     # opt-in ("strict_model"): refuse requests that name another model
         self.answer_room = True                       # 0.1.45: see ANSWER_ROOM_MIN_CAP (the config's "answer_room": false turns it off)
         self.reasoning_close_retry = False            # #1053 (opt-in): close the thinking once when a reply ends inside it
         self.codex_compaction_cache = False           # #924 (opt-in): a Codex compaction is rendered with its conversation's tools
@@ -5181,9 +5191,20 @@ class Service:
 
     def model_for(self, req) -> str:
         """The name to answer with: the request's own when it is the model's name or an alias (#297), else the model's.
-        Other names are still served, as before."""
+        Other names are still served, as before, unless `strict_model` refused the request (model_refusal)."""
         asked = req.get("model") if isinstance(req, dict) else None
         return asked if isinstance(asked, str) and asked in self.aliases else self.model
+
+    def model_refusal(self, req: dict) -> str | None:
+        """With the config's `strict_model`: why this request is refused for the model it names, else None.
+        A client that was switched to another model would otherwise get this one's answers under that name, and
+        size its prompts for that model's context.  A request that names no model is served."""
+        asked = req.get("model")
+        if not self.strict_model or asked in (None, "") or asked in self.model_names():
+            return None
+        # repr and the cut: the name is the client's text and goes into our log
+        return (f"model {str(asked)[:200]!r} is not loaded; this server serves "
+                f"{', '.join(repr(x) for x in self.model_names())}")
 
     def reported_ctx(self) -> int:
         """The context the endpoints report (/v1/status, /v1/models, /props, /health, /slots, /metrics): the engine's,
@@ -8374,6 +8395,13 @@ def make_handler(svc: Service):
                     except EngineDied as e:
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
+                # before anything is prepared: a refused request must not load an unloaded model
+                if path in ("/v1/chat/completions", "/v1/messages", "/v1/messages/count_tokens", "/v1/responses"):
+                    refusal = svc.model_refusal(req)
+                    if refusal:
+                        print(f"[strata] 404 {path}: {refusal}", flush=True)
+                        self._json(404, model_not_found_body(path, refusal))
+                        return
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
                     self.record = svc.begin_request(path, req)
                 if path == "/v1/responses":
@@ -10398,6 +10426,13 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         raise SystemExit(f"[strata] config {e}")
     if svc.aliases:
         print(f"[strata] model aliases: {', '.join(svc.aliases)}", flush=True)
+    strict = cfg.get("strict_model", False)             # opt-in: see Service.model_refusal
+    if not isinstance(strict, bool):
+        raise SystemExit(f"[strata] config \"strict_model\" must be true or false, not {strict!r}")
+    svc.strict_model = strict
+    if svc.strict_model:
+        print(f"[strata] strict model names: requests for any model but {', '.join(svc.model_names())} are refused",
+              flush=True)
     svc.api_key = preflight_api_key
     try:
         svc.telemetry_key = api_key_of(os.environ.get("STRATA_TELEMETRY_KEY") or cfg.get("telemetry_read_key", ""))
